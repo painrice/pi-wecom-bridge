@@ -1,4 +1,3 @@
-
 const AiBotPkg = require("@wecom/aibot-node-sdk");
 const AiBot = AiBotPkg.default || AiBotPkg;
 const generateReqId = AiBotPkg.generateReqId || (function() { return "req_" + Date.now() + "_" + Math.random().toString(36).slice(2,10); });
@@ -10,7 +9,24 @@ if (!botId || !secret) { console.error("[FATAL] Missing env vars"); process.exit
 var fs2 = require("node:fs");
 var path = require("node:path");
 var os = require("node:os");
-var AGENT_DIR = path.join(os.homedir(), ".pi", "agent");
+
+// ═══════════════════════════════════════════════════════════════
+// 持久化会话配置
+// ═══════════════════════════════════════════════════════════════
+// AGENT_DIR: Pi SDK 会话存储目录（本地持久化，重启后恢复）
+var AGENT_DIR = process.env.AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
+
+// SESSION_MODE: 会话模式
+//   - "persistent" (默认): 持久化到磁盘，支持跨重启记忆
+//   - "inmemory": 纯内存模式（旧行为）
+var SESSION_MODE = process.env.SESSION_MODE || "persistent";
+
+// CONTINUE_RECENT: 是否继续最近的会话（true=复用历史，false=每次新建）
+var CONTINUE_RECENT = process.env.CONTINUE_RECENT !== "false";
+
+console.log("[Config] AGENT_DIR: " + AGENT_DIR);
+console.log("[Config] SESSION_MODE: " + SESSION_MODE);
+console.log("[Config] CONTINUE_RECENT: " + CONTINUE_RECENT);
 
 function ensureModelsJson() {
   var apiUrl = process.env.PI_API_URL;
@@ -43,7 +59,27 @@ class PiBridge {
     if (process.env.PI_API_URL) model = reg.find("longcat", process.env.PI_MODEL || "LongCat-2.0");
     if (!model) model = pi.getModel("deepseek", "deepseek-chat");
     if (!model) { var av = await reg.getAvailable(); if (av.length) model = av[0]; else throw new Error("No model"); }
-    var sm = pi.SessionManager.inMemory(AGENT_DIR);
+    
+    // ═══════════════════════════════════════════════════════════
+    // 关键改动：支持持久化 SessionManager
+    // ═══════════════════════════════════════════════════════════
+    var sm;
+    var sessionDir = path.join(AGENT_DIR, "sessions");
+    
+    if (SESSION_MODE === "inmemory") {
+      // 纯内存模式（旧行为，重启丢失）
+      sm = pi.SessionManager.inMemory(AGENT_DIR);
+      console.log("[PiBridge] " + userId + " -> in-memory session");
+    } else if (CONTINUE_RECENT) {
+      // 持久化 + 继续最近会话（推荐：重启后恢复记忆）
+      sm = pi.SessionManager.continueRecent(AGENT_DIR, sessionDir);
+      console.log("[PiBridge] " + userId + " -> continue recent session");
+    } else {
+      // 持久化 + 新建会话
+      sm = pi.SessionManager.create(AGENT_DIR, sessionDir);
+      console.log("[PiBridge] " + userId + " -> new persistent session");
+    }
+    
     var res = await pi.createAgentSession({ agentDir: AGENT_DIR, authStorage: auth, modelRegistry: reg, model: model, thinkingLevel: "off", sessionManager: sm, tools: ["read", "bash", "grep"] });
     var session = res.session;
     // 注意：subscribe 闭包通过 entry 对象间接引用回调，这样复用 session 时能调用最新的回调
@@ -178,6 +214,7 @@ async function main() {
   console.log(" Pi-WeCom Bridge");
   console.log(" BotID: " + botId.substring(0, 10) + "...");
   console.log(" Model: " + (process.env.PI_MODEL || "default"));
+  console.log(" Session: " + SESSION_MODE + " (dir: " + AGENT_DIR + ")");
   console.log("===================");
 }
 main().catch(function(e) { console.error("[FATAL]", e); process.exit(1); });
