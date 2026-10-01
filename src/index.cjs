@@ -14,7 +14,8 @@ var os = require("node:os");
 // 持久化会话配置
 // ═══════════════════════════════════════════════════════════════
 // AGENT_DIR: Pi SDK 会话存储目录（本地持久化，重启后恢复）
-var AGENT_DIR = process.env.AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
+// 默认用独立目录 /root/.pi/bridge-agent，避免与 pi CLI 共用 ~/.pi/agent 导致配置互相覆盖
+var AGENT_DIR = process.env.AGENT_DIR || path.join("/root/.pi", "bridge-agent");
 
 // SESSION_MODE: 会话模式
 //   - "persistent" (默认): 持久化到磁盘，支持跨重启记忆
@@ -34,6 +35,11 @@ function ensureModelsJson() {
   var modelId = process.env.PI_MODEL || "LongCat-2.0";
   if (!apiUrl || !apiKey) return;
   var mp = path.join(AGENT_DIR, "models.json");
+  // 仅当文件不存在时写入，避免覆盖 pi CLI 的 models.json
+  if (fs2.existsSync(mp)) {
+    console.log("[PiBridge] models.json already exists, skip write");
+    return;
+  }
   var cfg = { providers: { longcat: { baseUrl: apiUrl, api: "openai-completions", apiKey: process.env.PI_API_KEY, models: [{ id: modelId, name: "LongCat-2.0", input: ["text"], contextWindow: 131072, maxTokens: 16384, compat: { supportsDeveloperRole: false, supportsReasoningEffort: false } }] } } };
   fs2.writeFileSync(mp, JSON.stringify(cfg, null, 2));
   console.log("[PiBridge] models.json -> longcat/" + modelId);
@@ -83,11 +89,39 @@ class PiBridge {
     var res = await pi.createAgentSession({ agentDir: AGENT_DIR, authStorage: auth, modelRegistry: reg, model: model, thinkingLevel: "off", sessionManager: sm, tools: ["read", "bash", "grep"] });
     var session = res.session;
     // 注意：subscribe 闭包通过 entry 对象间接引用回调，这样复用 session 时能调用最新的回调
-    var entry2 = { session, unsubscribe: null, streaming: false, onDelta, onComplete, onError };
+    var entry2 = { session, unsubscribe: null, streaming: false, onDelta, onComplete, onError, stepCount: 0, currentTool: null };
     var unsub = session.subscribe(function(ev) {
+      // 1. 文本增量
       if (ev.type === "message_update" && ev.assistantMessageEvent && ev.assistantMessageEvent.type === "text_delta") {
         entry2.onDelta(ev.assistantMessageEvent.delta);
       }
+      // 2. agent_message 事件：包含 tool_use / thinking
+      if (ev.type === "agent_message" && ev.message) {
+        var msg = ev.message;
+        // tool_use 类型（工具调用开始）
+        if (msg.type === "tool_use" || (msg.toolCalls && msg.toolCalls.length)) {
+          var tc = msg.toolCalls ? msg.toolCalls[0] : msg;
+          var name = tc.name || tc.tool || "tool";
+          entry2.stepCount++;
+          entry2.currentTool = name;
+          var stepMsg = "🔧 正在执行 " + name + "…";
+          entry2.onDelta(stepMsg + "\n");
+        }
+        // thinking 类型（推理过程）
+        if (msg.type === "thinking" && msg.content) {
+          entry2.onDelta("💭 " + msg.content + "\n");
+        }
+      }
+      // 3. 兼容旧事件名 tool_call / thinking
+      if (ev.type === "tool_call" && ev.tool) {
+        entry2.stepCount++;
+        entry2.currentTool = ev.tool;
+        entry2.onDelta("🔧 正在执行 " + ev.tool + "…\n");
+      }
+      if (ev.type === "thinking" && ev.content) {
+        entry2.onDelta("💭 " + ev.content + "\n");
+      }
+      // 4. 任务结束
       if (ev.type === "agent_end") {
         // 防重复：确保 onComplete 只执行一次
         if (!entry2.completed) {
@@ -101,15 +135,32 @@ class PiBridge {
     console.log("[PiBridge] " + userId + " -> " + model.provider + "/" + model.id);
     return session;
   }
-  async sendMessage(userId, msg, onDelta, onComplete, onError) {
+  async sendMessage(userId, msg, onDelta, onComplete, onError, ws, fr, streamId) {
     try {
       var s = await this.getOrCreateSession(userId, onDelta, onComplete, onError);
       var e = this.sessions.get(userId);
-      if (e) { e.streaming = true; e.completed = false; }
+      if (e) { e.streaming = true; e.completed = false; e.stepCount = 0; }
+      // 启动心跳：每 30 秒发送一次进度，防止长任务完全静默
+      var heartbeatTimer = null;
+      if (ws && fr && streamId) {
+        heartbeatTimer = setInterval(function() {
+          var entry = this.sessions.get(userId);
+          if (!entry || entry.completed) {
+            clearInterval(heartbeatTimer);
+            return;
+          }
+          var steps = entry.stepCount || 0;
+          var tool = entry.currentTool ? " (" + entry.currentTool + ")" : "";
+          var msg = "⏳ 仍在处理…（已执行 " + steps + " 步" + tool + ")";
+          ws.replyStreamNonBlocking(fr, streamId, msg, false).catch(function() {});
+        }.bind(this), 30000);
+        // 将 timer 存入 entry，以便 onComplete 时清理
+        e.heartbeatTimer = heartbeatTimer;
+      }
       await s.prompt(msg);
     }
     catch (err) { console.error("[PiBridge] " + err.message); onError(err); }
-    finally { var e2 = this.sessions.get(userId); if (e2) e2.streaming = false; }
+    finally { var e2 = this.sessions.get(userId); if (e2) { e2.streaming = false; if (e2.heartbeatTimer) clearInterval(e2.heartbeatTimer); } }
   }
 }
 
@@ -151,23 +202,31 @@ function connectWS() {
     // 发送 "thinking" 指示
     ws.replyStreamNonBlocking(fr, streamId, "🤔 正在思考…", false).catch(function() {});
 
+    var fullReply = "";
+    var replySent = false;
     try {
-      // 收集完整回复，然后一次性发送 fin=true
-      var fullReply = "";
-      var replySent = false;
+      // 实时发送文本增量和工具执行状态，而不是等到最后一次性发送
       await bridge.sendMessage(u, m,
-        function(d) { fullReply += d; },
+        function(d) {
+          // 每个文本增量立即发出去（fin=false 表示非终止消息）
+          if (d && !replySent) {
+            fullReply += d;
+            ws.replyStreamNonBlocking(fr, streamId, d, false).catch(function() {});
+          }
+        },
         function() {
           if (replySent) return;  // 防重复
           replySent = true;
-          var text = fullReply || "（空回复）";
-          ws.replyStreamNonBlocking(fr, streamId, text, true).catch(function() {});
+          // 发送最终完整回复（fin=true），之前已经通过增量发送了所有文本
+          // 这里发送累积的完整内容，因为 WeCom stream 消息是替换式更新
+          ws.replyStreamNonBlocking(fr, streamId, fullReply || "（空回复）", true).catch(function() {});
         },
         function(err) {
-          if (replySent) return;  // 防重复
+          if (replySent) return; // 防重复
           replySent = true;
           ws.replyStreamNonBlocking(fr, streamId, "Error: " + err.message, true).catch(function() {});
-        }
+        },
+        ws, fr, streamId  // 传入流式参数，供 heartbeat 使用
       );
       // 如果 sendMessage 正常完成但 onComplete 没被调用（理论上不应发生）
       if (!replySent) {
