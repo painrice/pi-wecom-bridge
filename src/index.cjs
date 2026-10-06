@@ -44,6 +44,9 @@ var SESSION_MODE = process.env.SESSION_MODE || "persistent";
 // CONTINUE_RECENT: 是否继续最近的会话（true=复用历史，false=每次新建）
 var CONTINUE_RECENT = process.env.CONTINUE_RECENT !== "false";
 
+// 长上下文提醒阈值：每累计 N 条用户消息提醒一次 /new（防 token 无限增长）
+var CONTEXT_REMIND_EVERY = 150;
+
 console.log("[Config] AGENT_DIR: " + AGENT_DIR);
 console.log("[Config] SESSION_MODE: " + SESSION_MODE);
 console.log("[Config] CONTINUE_RECENT: " + CONTINUE_RECENT);
@@ -90,15 +93,30 @@ function ensureModelsJson() {
   console.log("[PiBridge] models.json -> longcat/" + modelId);
 }
 
+// ═══════════════════════════════════════════════════════════════
+// 会话隔离（P0 修复）
+//   key 规则：私聊 = "user:<userid>"（一人一个上下文）
+//             群聊 = "group:<chatid>"（同群成员共享群会话，跨群/私聊互不串）
+//   每个 key 独立 sessionDir：sessions/<safeKey>/，continueRecent 只在
+//   自己目录里取最近会话——修复旧版所有人共用一个全局最近会话的互串 bug
+// ═══════════════════════════════════════════════════════════════
+function sessionKeyOf(chatType, userid, chatid) {
+  var isGroup = chatType === "group" || chatType === "groupchat";
+  return isGroup ? ("group:" + (chatid || userid)) : ("user:" + userid);
+}
+function safeKeyOf(key) { return key.replace(/[^A-Za-z0-9_-]/g, "_"); }
+function sessionDirOf(key) { return path.join(AGENT_DIR, "sessions", safeKeyOf(key)); }
+
 class PiBridge {
   constructor(pi) { this.sessions = new Map(); this._ready = false; this.pi = pi; }
   _ensureReady() { if (this._ready) return; if (!fs2.existsSync(AGENT_DIR)) fs2.mkdirSync(AGENT_DIR, { recursive: true }); ensureModelsJson(); this._ready = true; }
-  async getOrCreateSession(userId, onDelta, onComplete, onError) {
+  async getOrCreateSession(key, onDelta, onStatus, onComplete, onError) {
     this._ensureReady();
-    var entry = this.sessions.get(userId);
+    var entry = this.sessions.get(key);
     if (entry) {
-      // 更新 entry 上的回调引用（subscribe 闭包会读取 entry.onComplete）
+      // 更新 entry 上的回调引用（subscribe 闭包会读取 entry 上的最新回调）
       entry.onDelta = onDelta;
+      entry.onStatus = onStatus;
       entry.onComplete = onComplete;
       entry.onError = onError;
       return entry.session;
@@ -112,65 +130,55 @@ class PiBridge {
     if (!model) model = pi.getModel(provider, modelId);
     if (!model && provider !== "longcat") model = pi.getModel("deepseek", "deepseek-chat");
     if (!model) { var av = await reg.getAvailable(); if (av.length) model = av[0]; else throw new Error("No model"); }
-    
-    // ═══════════════════════════════════════════════════════════
-    // 关键改动：支持持久化 SessionManager
-    // ═══════════════════════════════════════════════════════════
+
     var sm;
-    var sessionDir = path.join(AGENT_DIR, "sessions");
-    
+    var sessionDir = sessionDirOf(key);   // per-key 目录：隔离 + 持久化
+
     if (SESSION_MODE === "inmemory") {
-      // 纯内存模式（旧行为，重启丢失）
-      sm = pi.SessionManager.inMemory(AGENT_DIR);
-      console.log("[PiBridge] " + userId + " -> in-memory session");
+      sm = pi.SessionManager.inMemory(sessionDir);
+      console.log("[PiBridge] " + key + " -> in-memory session");
     } else if (CONTINUE_RECENT) {
-      // 持久化 + 继续最近会话（推荐：重启后恢复记忆）
       sm = pi.SessionManager.continueRecent(AGENT_DIR, sessionDir);
-      console.log("[PiBridge] " + userId + " -> continue recent session");
+      console.log("[PiBridge] " + key + " -> continue recent session (" + safeKeyOf(key) + ")");
     } else {
-      // 持久化 + 新建会话
       sm = pi.SessionManager.create(AGENT_DIR, sessionDir);
-      console.log("[PiBridge] " + userId + " -> new persistent session");
+      console.log("[PiBridge] " + key + " -> new persistent session");
     }
-    
+
     var res = await pi.createAgentSession({ agentDir: AGENT_DIR, authStorage: auth, modelRegistry: reg, model: model, thinkingLevel: "off", sessionManager: sm, tools: ["read", "bash", "grep"] });
     var session = res.session;
     // 注意：subscribe 闭包通过 entry 对象间接引用回调，这样复用 session 时能调用最新的回调
-    var entry2 = { session, unsubscribe: null, streaming: false, onDelta, onComplete, onError, stepCount: 0, currentTool: null };
+    var entry2 = { session, unsubscribe: null, streaming: false, onDelta, onStatus, onError, onComplete, stepCount: 0, currentTool: null, msgCount: 0, completed: false };
     var unsub = session.subscribe(function(ev) {
-      // 1. 文本增量
+      // 1. 文本增量（正文，进 fullReply）
       if (ev.type === "message_update" && ev.assistantMessageEvent && ev.assistantMessageEvent.type === "text_delta") {
         entry2.onDelta(ev.assistantMessageEvent.delta);
       }
-      // 2. agent_message 事件：包含 tool_use / thinking
+      // 2. agent_message 事件：工具调用 / 推理过程 → 走 onStatus（只推流展示进度，不进最终正文）
       if (ev.type === "agent_message" && ev.message) {
         var msg = ev.message;
-        // tool_use 类型（工具调用开始）
         if (msg.type === "tool_use" || (msg.toolCalls && msg.toolCalls.length)) {
           var tc = msg.toolCalls ? msg.toolCalls[0] : msg;
           var name = tc.name || tc.tool || "tool";
           entry2.stepCount++;
           entry2.currentTool = name;
-          var stepMsg = "🔧 正在执行 " + name + "…";
-          entry2.onDelta(stepMsg + "\n");
+          entry2.onStatus("🔧 正在执行 " + name + "…\n");
         }
-        // thinking 类型（推理过程）
         if (msg.type === "thinking" && msg.content) {
-          entry2.onDelta("💭 " + msg.content + "\n");
+          entry2.onStatus("💭 " + msg.content + "\n");
         }
       }
       // 3. 兼容旧事件名 tool_call / thinking
       if (ev.type === "tool_call" && ev.tool) {
         entry2.stepCount++;
         entry2.currentTool = ev.tool;
-        entry2.onDelta("🔧 正在执行 " + ev.tool + "…\n");
+        entry2.onStatus("🔧 正在执行 " + ev.tool + "…\n");
       }
       if (ev.type === "thinking" && ev.content) {
-        entry2.onDelta("💭 " + ev.content + "\n");
+        entry2.onStatus("💭 " + ev.content + "\n");
       }
       // 4. 任务结束
       if (ev.type === "agent_end") {
-        // 防重复：确保 onComplete 只执行一次
         if (!entry2.completed) {
           entry2.completed = true;
           entry2.onComplete();
@@ -178,23 +186,34 @@ class PiBridge {
       }
     });
     entry2.unsubscribe = unsub;
-    this.sessions.set(userId, entry2);
-    console.log("[PiBridge] " + userId + " -> " + model.provider + "/" + model.id);
+    this.sessions.set(key, entry2);
+    console.log("[PiBridge] " + key + " -> " + model.provider + "/" + model.id);
     return session;
   }
-  async sendMessage(userId, msg, onDelta, onComplete, onError, ws, fr, streamId, streamState) {
+  // /new：丢弃会话对象 + 清空该 key 的会话目录（下次消息将新建干净会话）
+  resetSession(key) {
+    var entry = this.sessions.get(key);
+    if (!entry) return true;   // 本来就没有活跃会话，直接视为成功
+    if (entry.streaming) return false;   // 有任务在跑时不允许重置，防悬空
+    try { if (entry.unsubscribe) entry.unsubscribe(); } catch (e) {}
+    try { fs2.rmSync(sessionDirOf(key), { recursive: true, force: true }); } catch (e) {}
+    this.sessions.delete(key);
+    return true;
+  }
+  async sendMessage(key, msg, onDelta, onStatus, onComplete, onError, ws, fr, streamId, streamState, notifyId) {
     try {
-      var s = await this.getOrCreateSession(userId, onDelta, onComplete, onError);
-      var e = this.sessions.get(userId);
-      if (e) { e.streaming = true; e.completed = false; e.stepCount = 0; }
+      var s = await this.getOrCreateSession(key, onDelta, onStatus, onComplete, onError);
+      var e = this.sessions.get(key);
+      if (e) { e.streaming = true; e.completed = false; e.stepCount = 0; e.msgCount++; }
       // 启动心跳：每 30 秒发送一次进度，防止长任务完全静默
       // 死流保护：心跳检查返回的 errcode，流过期(846608)即停心跳、只发一次 sendMessage 通知，
       // 避免僵尸流循环（30s 一直给已作废的流发心跳）
       var heartbeatTimer = null;
       var hbAnnounced = false;
+      var hbTarget = notifyId || key;   // SDK sendMessage 需要真实 chatid（单聊=userid，群聊=群 ID）
       if (ws && fr && streamId) {
         heartbeatTimer = setInterval(function() {
-          var entry = this.sessions.get(userId);
+          var entry = this.sessions.get(key);
           if (!entry || entry.completed) {
             clearInterval(heartbeatTimer);
             return;
@@ -202,26 +221,24 @@ class PiBridge {
           var steps = entry.stepCount || 0;
           var tool = entry.currentTool ? " (" + entry.currentTool + ")" : "";
           if (streamState && streamState.dead) {
-            // 流已过期：停心跳，一次性告知用户（避免 30s 死循环心跳）
             clearInterval(heartbeatTimer);
             if (!hbAnnounced) {
               hbAnnounced = true;
-              ws.sendMessage(userId, { msgtype: "text", text: { content: "⏳ 仍在处理（已执行 " + steps + " 步" + tool + "），之前的流已过期，完成后会自动通知你" } }).catch(function() {});
+              ws.sendMessage(hbTarget, { msgtype: "text", text: { content: "⏳ 仍在处理（已执行 " + steps + " 步" + tool + "），之前的流已过期，完成后会自动通知你" } }).catch(function() {});
             }
             return;
           }
-          var hbMsg = "⏳ 仍在处理…（已执行 " + steps + " 步" + tool + ")";
+          var hbMsg = "⏳ 仍在处理…（已执行 " + steps + " 步" + tool + "）";
           ws.replyStreamNonBlocking(fr, streamId, hbMsg, false).then(function(r) {
             if (r && r.errcode === STREAM_EXPIRED && streamState) streamState.dead = true;
           }).catch(function() {});
         }.bind(this), 30000);
-        // 将 timer 存入 entry，以便 onComplete 时清理
         e.heartbeatTimer = heartbeatTimer;
       }
       await s.prompt(msg);
     }
     catch (err) { console.error("[PiBridge] " + err.message); onError(err); }
-    finally { var e2 = this.sessions.get(userId); if (e2) { e2.streaming = false; if (e2.heartbeatTimer) clearInterval(e2.heartbeatTimer); } }
+    finally { var e2 = this.sessions.get(key); if (e2) { e2.streaming = false; if (e2.heartbeatTimer) clearInterval(e2.heartbeatTimer); } }
   }
 }
 
@@ -231,6 +248,19 @@ var bridge = null;
 // ── WebSocket client wrapper with auto-reconnect ──
 var ws = null;
 var reconnecting = false;
+
+// per-key 串行队列：同一会话（同一人/同一群）的消息严格按序处理，防并发 prompt 交错
+var pendingQueue = new Map();   // key -> 最后一个入队任务的 Promise（已 catch）
+var queueDepth = new Map();     // key -> 当前排队中的任务数（含执行中）
+
+function enqueue(key, task) {
+  var depth = queueDepth.get(key) || 0;
+  queueDepth.set(key, depth + 1);
+  var prev = pendingQueue.get(key) || Promise.resolve();
+  var run = prev.then(task, task);   // 前一个失败不影响本条
+  pendingQueue.set(key, run.catch(function() {}));
+  return run;
+}
 
 function connectWS() {
   ws = new AiBot.WSClient({ botId, secret, maxReconnectAttempts: -1, heartbeatInterval: 30000, requestTimeout: 60000 });
@@ -250,14 +280,41 @@ function connectWS() {
     var c = fr.body && fr.body.text ? fr.body.text.content : null;
     var u = fr.body && fr.body.from ? fr.body.from.userid : null;
     var ct = fr.body ? (fr.body.chatType || fr.body.chattype) : null;
+    var chatid = (fr.body && fr.body.chatid) || u;   // 单聊=userid，群聊=群 ID（SDK sendMessage 语义）
     if (!c || !u) return;
     var m = c;
     if (ct === "group" || ct === "groupchat") m = c.replace(/^@\S+\s*/, "").trim();
     if (!m) return;
-    console.log("[Bridge] " + u + ": " + m.substring(0, 80));
+    var key = sessionKeyOf(ct, u, chatid);
+    console.log("[Bridge] [" + key + "] " + u + ": " + m.substring(0, 80));
+
+    // ── 用户命令（不走模型）──
+    var cmd = m.trim().toLowerCase();
+    if (cmd === "/new" || cmd === "/help" || cmd === "/status") {
+      var sid = generateReqId("c");
+      if (cmd === "/new") {
+        var okReset = bridge.resetSession(key);
+        if (okReset) {
+          await ws.replyStreamNonBlocking(fr, sid, "🆕 已开启新会话，之前的对话记忆已清空", true).catch(function() {});
+        } else {
+          await ws.replyStreamNonBlocking(fr, sid, "⏳ 当前有任务正在处理，完成后再发 /new 重置会话", true).catch(function() {});
+        }
+      } else if (cmd === "/help") {
+        await ws.replyStreamNonBlocking(fr, sid,
+          "📖 可用命令：\n/new — 清空当前会话记忆，重新开始\n/status — 查看模型与会话状态\n/help — 显示本帮助\n\n其他任何消息直接和 AI 对话即可。",
+          true).catch(function() {});
+      } else {
+        var depth = queueDepth.get(key) || 0;
+        await ws.replyStreamNonBlocking(fr, sid,
+          "📊 状态\n模型: " + resolveProvider() + "/" + resolveModelId(resolveProvider()) +
+          "\n会话: " + key + " (" + SESSION_MODE + (CONTINUE_RECENT ? "/continue" : "/new") + ")" +
+          "\n队列: " + (depth > 0 ? depth + " 条处理中" : "空闲"),
+          true).catch(function() {});
+      }
+      return;
+    }
 
     // 生成固定的 streamId，确保 thinking 和最终回复使用同一个 stream
-    var rid = fr.headers && fr.headers.reqId ? fr.headers.reqId : fr.req_id;
     var streamId = generateReqId("s");
 
     var fullReply = "";
@@ -267,7 +324,6 @@ function connectWS() {
     // 空内容 / 限流类错误自动重试（free 档模型不稳定，整轮吐空白或 429）
     var RETRYABLE = /429|rate.?limit|too many|timeout|ECONN|fetch failed|503/i;
     // ── 死流保护（参考 grok-wecom-bot 的 846608 处理模式）──
-    // 状态先声明，thinking 推送的 .then 回调才会引用到（函数内调用时均已初始化）
     var streamState = { dead: false };
     var hardTimer = null;
     function markStreamDead(reason) {
@@ -284,6 +340,7 @@ function connectWS() {
       if (r && r.errcode === STREAM_EXPIRED) { markStreamDead("846608 stream expired"); return false; }
       return true;
     }
+    // fallback 发送：chatid 单聊=userid、群聊=群 ID，保证群里的问题答案回群里（修复旧版发私聊）
     async function sendLong(cid, text) {
       try {
         if (text.length <= MAX_STREAM_CHUNK) {
@@ -303,7 +360,7 @@ function connectWS() {
         if (ok) return;
       }
       console.log("[Bridge] final push via stream unavailable, fallback to sendMessage");
-      await sendLong(u, text || "");
+      await sendLong(chatid, text || "");
     }
     function finishDeliver(text, fin) {
       if (replySent) return;
@@ -318,11 +375,12 @@ function connectWS() {
       console.log("[Bridge] hard timeout (25min) hit, force-delivering partial result");
       finishDeliver((fullReply ? fullReply + "\n\n" : "") + "（任务 25 分钟未完成，已强制结束，可重新下达指令）", true);
     }, HARD_TIMEOUT_MS);
+
     async function runSend() {
       attempts++;
-      await bridge.sendMessage(u, m,
+      await bridge.sendMessage(key, m,
         function(d) {
-          // 每个文本增量立即发出去（fin=false 表示非终止消息）；流死后停推（内容仍累积，走 fallback）
+          // 正文增量：累积 + 推流；流死后只累积（最终走 fallback）
           if (d && !replySent) {
             fullReply += d;
             if (!streamState.dead) {
@@ -330,6 +388,14 @@ function connectWS() {
                 if (r && r.errcode === STREAM_EXPIRED) markStreamDead("846608 on delta");
               }).catch(function() {});
             }
+          }
+        },
+        function(d) {
+          // 过程指示（工具/思考）：只推流展示进度，不进最终正文（修复旧版噪音混入 fullReply）
+          if (d && !replySent && !streamState.dead) {
+            ws.replyStreamNonBlocking(fr, streamId, d, false).then(function(r) {
+              if (r && r.errcode === STREAM_EXPIRED) markStreamDead("846608 on status");
+            }).catch(function() {});
           }
         },
         function() {
@@ -352,20 +418,35 @@ function connectWS() {
           }
           finishDeliver("Error: " + err.message, true);
         },
-        ws, fr, streamId, streamState  // 传入流式参数 + 死流状态对象，供 heartbeat 感知
+        ws, fr, streamId, streamState, chatid
       );
-      // 如果 sendMessage 正常完成但 onComplete 没被调用（理论上不应发生）
       if (!replySent) {
         finishDeliver(fullReply || "（模型未返回内容，请稍后再试）", true);
       }
     }
-    try {
-      await runSend();
-    } catch (err) {
-      console.error("[Bridge] " + err.message);
-      if (!replySent) {
-        finishDeliver("Error: " + err.message, true);
+
+    // per-key 串行入队；入队前已知前面还有任务时，先在流上提示排队
+    var depthBefore = queueDepth.get(key) || 0;
+    await enqueue(key, async function() {
+      if (depthBefore > 0 && !replySent) {
+        ws.replyStreamNonBlocking(fr, streamId, "⏳ 前面还有 " + depthBefore + " 条消息在处理，本条已排队…", false).catch(function() {});
       }
+      try {
+        await runSend();
+      } catch (err) {
+        console.error("[Bridge] " + err.message);
+        if (!replySent) {
+          finishDeliver("Error: " + err.message, true);
+        }
+      } finally {
+        if (!replySent) finishDeliver(fullReply || "（模型未返回内容，请稍后再试）", true);
+      }
+    });
+
+    // 长上下文提醒：会话消息数达到阈值倍数时提醒一次 /new（P1-8）
+    var entry = bridge.sessions.get(key);
+    if (entry && entry.msgCount > 0 && entry.msgCount % CONTEXT_REMIND_EVERY === 0) {
+      ws.replyStreamNonBlocking(fr, generateReqId("r"), "💡 本会话已累计 " + entry.msgCount + " 条消息，上下文较长可能影响回复质量，建议发送 /new 开启新会话", false).catch(function() {});
     }
   });
 
@@ -373,10 +454,10 @@ function connectWS() {
     var u2 = fr.body && fr.body.from ? fr.body.from.userid : null;
     if (!u2) return;
     try { var r2 = await ws.downloadFile(fr.body.image.url, fr.body.image.aeskey); console.log("[Bridge] IMG " + r2.buffer.length); } catch (e) {}
-    ws.replyStreamNonBlocking(fr, generateReqId("i"), "[IMG]", true).catch(function() {});
+    ws.replyStreamNonBlocking(fr, generateReqId("i"), "📸 图片已收到（当前模型暂不支持识图，请用文字描述你的问题）", true).catch(function() {});
   });
 
-  ws.on("event.enter_chat", function(fr) { ws.replyWelcome(fr, { msgtype: "text", text: { content: "Hi! Pi here." } }).catch(function() {}); });
+  ws.on("event.enter_chat", function(fr) { ws.replyWelcome(fr, { msgtype: "text", text: { content: "Hi! Pi here. 发送 /help 查看可用命令。" } }).catch(function() {}); });
   ws.on("event.template_card_event", function(fr) { console.log("[Bridge] Card: " + JSON.stringify(fr.body)); });
 
   ws.connect();
@@ -400,7 +481,7 @@ async function main() {
   console.log(" Pi-WeCom Bridge");
   console.log(" BotID: " + botId.substring(0, 10) + "...");
   console.log(" Model: " + resolveProvider() + "/" + resolveModelId(resolveProvider()));
-  console.log(" Session: " + SESSION_MODE + " (dir: " + AGENT_DIR + ")");
+  console.log(" Session: " + SESSION_MODE + " per-key isolation (dir: " + AGENT_DIR + ")");
   console.log("===================");
 }
 main().catch(function(e) { console.error("[FATAL]", e); process.exit(1); });

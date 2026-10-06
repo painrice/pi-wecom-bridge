@@ -73,9 +73,9 @@ module.exports = {
 /root/.pi/shared-agent/
 ├── auth.json              # 认证信息（共享）
 ├── models.json            # 模型配置（共享）
-├── sessions/              # 会话历史（共享）
-│   └── *.jsonl            # 每个用户的对话记录
-└── ...
+└── sessions/              # 会话历史（按 key 隔离的子目录）
+    ├── user_<userid>/     # 私聊：每个用户独立会话
+    └── group_<chatid>/    # 群聊：每个群独立会话
 ```
 
 ---
@@ -110,10 +110,10 @@ pm2 logs pi-wecom
 
 ## 注意事项
 
-1. **会话隔离**：不同用户（按 userId）有独立的会话历史
-2. **并发安全**：多个 Agent 写入同一个目录时使用文件锁，一般不会冲突
-3. **磁盘空间**：会话历史会持续增长，建议定期清理或使用 compaction
-4. **模型差异**：不同 Agent 可以使用不同的模型（PI_MODEL），但共享上下文
+1. **会话隔离**：私聊按 userId、群聊按 chatid 各自独立子目录（`sessions/user_<userid>/`、`sessions/group_<chatid>/`），不同人/不同群上下文互不串
+2. **并发安全**：同一会话内消息由 bridge 串行队列按序处理；多 Agent 写不同子目录，一般不会冲突
+3. **磁盘空间**：会话历史会持续增长，用户可发 `/new` 重置；程序会在长会话时自动提醒
+4. **模型差异**：不同 Agent 可以使用不同的模型（PI_MODEL），但共享 auth/models 配置
 
 ---
 
