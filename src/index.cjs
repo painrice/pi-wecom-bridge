@@ -148,35 +148,40 @@ class PiBridge {
     var res = await pi.createAgentSession({ agentDir: AGENT_DIR, authStorage: auth, modelRegistry: reg, model: model, thinkingLevel: "off", sessionManager: sm, tools: ["read", "bash", "grep"] });
     var session = res.session;
     // 注意：subscribe 闭包通过 entry 对象间接引用回调，这样复用 session 时能调用最新的回调
-    var entry2 = { session, unsubscribe: null, streaming: false, onDelta, onStatus, onError, onComplete, stepCount: 0, currentTool: null, msgCount: 0, completed: false };
+    var entry2 = { session, unsubscribe: null, streaming: false, onDelta, onStatus, onError, onComplete, stepCount: 0, currentTool: null, msgCount: 0, completed: false, thinkingShown: false };
     var unsub = session.subscribe(function(ev) {
       // 1. 文本增量（正文，进 fullReply）
       if (ev.type === "message_update" && ev.assistantMessageEvent && ev.assistantMessageEvent.type === "text_delta") {
         entry2.onDelta(ev.assistantMessageEvent.delta);
       }
-      // 2. agent_message 事件：工具调用 / 推理过程 → 走 onStatus（只推流展示进度，不进最终正文）
-      if (ev.type === "agent_message" && ev.message) {
-        var msg = ev.message;
-        if (msg.type === "tool_use" || (msg.toolCalls && msg.toolCalls.length)) {
-          var tc = msg.toolCalls ? msg.toolCalls[0] : msg;
-          var name = tc.name || tc.tool || "tool";
-          entry2.stepCount++;
-          entry2.currentTool = name;
-          entry2.onStatus("🔧 正在执行 " + name + "…\n");
-        }
-        if (msg.type === "thinking" && msg.content) {
-          entry2.onStatus("💭 " + msg.content + "\n");
-        }
-      }
-      // 3. 兼容旧事件名 tool_call / thinking
-      if (ev.type === "tool_call" && ev.tool) {
+    // 2. agent_message 事件：工具调用 / 推理过程 → 走 onStatus（只推流展示进度，不进最终正文）
+    //    thinking 原文不推流（reasoning 模型 thinking 可达数千字，累计推流会撑爆企微单条
+    //    20480 上限导致后续帧全部静默失败——这是「过程有话、结果丢失」bug 的根因），
+    //    改为整个任务只提示一次「深度思考中」
+    if (ev.type === "agent_message" && ev.message) {
+      var msg = ev.message;
+      if (msg.type === "tool_use" || (msg.toolCalls && msg.toolCalls.length)) {
+        var tc = msg.toolCalls ? msg.toolCalls[0] : msg;
+        var name = tc.name || tc.tool || "tool";
         entry2.stepCount++;
-        entry2.currentTool = ev.tool;
-        entry2.onStatus("🔧 正在执行 " + ev.tool + "…\n");
+        entry2.currentTool = name;
+        entry2.onStatus("🔧 正在执行 " + name + "…\n");
       }
-      if (ev.type === "thinking" && ev.content) {
-        entry2.onStatus("💭 " + ev.content + "\n");
+      if (msg.type === "thinking" && msg.content && !entry2.thinkingShown) {
+        entry2.thinkingShown = true;
+        entry2.onStatus("💭 深度思考中…\n");
       }
+    }
+    // 3. 兼容旧事件名 tool_call / thinking
+    if (ev.type === "tool_call" && ev.tool) {
+      entry2.stepCount++;
+      entry2.currentTool = ev.tool;
+      entry2.onStatus("🔧 正在执行 " + ev.tool + "…\n");
+    }
+    if (ev.type === "thinking" && ev.content && !entry2.thinkingShown) {
+      entry2.thinkingShown = true;
+      entry2.onStatus("💭 深度思考中…\n");
+    }
       // 4. 任务结束
       if (ev.type === "agent_end") {
         if (!entry2.completed) {
@@ -204,7 +209,7 @@ class PiBridge {
     try {
       var s = await this.getOrCreateSession(key, onDelta, onStatus, onComplete, onError);
       var e = this.sessions.get(key);
-      if (e) { e.streaming = true; e.completed = false; e.stepCount = 0; e.msgCount++; }
+      if (e) { e.streaming = true; e.completed = false; e.stepCount = 0; e.msgCount++; e.thinkingShown = false; }
       // 启动心跳：每 30 秒发送一次进度，防止长任务完全静默
       // 死流保护：心跳检查返回的 errcode，流过期(846608)即停心跳、只发一次 sendMessage 通知，
       // 避免僵尸流循环（30s 一直给已作废的流发心跳）
@@ -230,7 +235,7 @@ class PiBridge {
           }
           var hbMsg = "⏳ 仍在处理…（已执行 " + steps + " 步" + tool + "）";
           ws.replyStreamNonBlocking(fr, streamId, hbMsg, false).then(function(r) {
-            if (r && r.errcode === STREAM_EXPIRED && streamState) streamState.dead = true;
+            if (r && r !== "skipped" && r.errcode && streamState) streamState.dead = true;   // 任何 errcode 都停进度流
           }).catch(function() {});
         }.bind(this), 30000);
         e.heartbeatTimer = heartbeatTimer;
@@ -337,7 +342,8 @@ function connectWS() {
       var r;
       try { r = await ws.replyStreamNonBlocking(fr, sid, text, fin); }
       catch (e) { markStreamDead("ws error: " + e.message); return false; }
-      if (r && r.errcode === STREAM_EXPIRED) { markStreamDead("846608 stream expired"); return false; }
+      // 'skipped'（上帧未 ack 主动跳过）属正常，其余任何 errcode 都视为流不可用
+      if (r && r !== "skipped" && r.errcode) { markStreamDead("errcode " + r.errcode + " on stream"); return false; }
       return true;
     }
     // fallback 发送：chatid 单聊=userid、群聊=群 ID，保证群里的问题答案回群里（修复旧版发私聊）
@@ -354,13 +360,14 @@ function connectWS() {
         }
       } catch (e) { console.error("[Bridge] sendMessage fallback failed: " + e.message); }
     }
+    // 最终结果投递：qwenpaw/hermes 式「进度走流、结果走独立消息」——
+    // 最终正文 100% 通过 sendMessage(chatid) 送达（markdown，超长自动分块），
+    // 不再依赖流状态判断。此前「流推送成功与否」无法可靠判定（20480 累计超限等
+    // errcode 静默失败），导致长任务结果丢失；进度流只负责 thinking/工具指示。
     async function deliverFinal(text, fin) {
-      if (!streamState.dead) {
-        var ok = await pushStream(streamId, text, fin !== false);
-        if (ok) return;
-      }
-      console.log("[Bridge] final push via stream unavailable, fallback to sendMessage");
-      await sendLong(chatid, text || "");
+      // 收口进度流（失败无所谓，结果不依赖它）
+      if (!streamState.dead) await pushStream(streamId, "", fin !== false).catch(function() {});
+      await sendLong(chatid, text || "（模型未返回内容，请稍后再试）");
     }
     function finishDeliver(text, fin) {
       if (replySent) return;
@@ -380,22 +387,16 @@ function connectWS() {
       attempts++;
       await bridge.sendMessage(key, m,
         function(d) {
-          // 正文增量：累积 + 推流；流死后只累积（最终走 fallback）
+          // 正文增量：只累积（最终结果由 deliverFinal 统一走 sendMessage 送达），
+          // 不再逐字推流——多轮工具任务累计内容会撑爆企微流 20480 上限
           if (d && !replySent) {
             fullReply += d;
-            if (!streamState.dead) {
-              ws.replyStreamNonBlocking(fr, streamId, d, false).then(function(r) {
-                if (r && r.errcode === STREAM_EXPIRED) markStreamDead("846608 on delta");
-              }).catch(function() {});
-            }
           }
         },
         function(d) {
-          // 过程指示（工具/思考）：只推流展示进度，不进最终正文（修复旧版噪音混入 fullReply）
+          // 过程指示（工具/思考提示）：只推流展示进度，不进最终正文
           if (d && !replySent && !streamState.dead) {
-            ws.replyStreamNonBlocking(fr, streamId, d, false).then(function(r) {
-              if (r && r.errcode === STREAM_EXPIRED) markStreamDead("846608 on status");
-            }).catch(function() {});
+            ws.replyStreamNonBlocking(fr, streamId, d, false).catch(function() {});
           }
         },
         function() {
