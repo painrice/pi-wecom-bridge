@@ -210,12 +210,15 @@ class PiBridge {
       var s = await this.getOrCreateSession(key, onDelta, onStatus, onComplete, onError);
       var e = this.sessions.get(key);
       if (e) { e.streaming = true; e.completed = false; e.stepCount = 0; e.msgCount++; e.thinkingShown = false; }
-      // 启动心跳：每 30 秒发送一次进度，防止长任务完全静默
-      // 死流保护：心跳检查返回的 errcode，流过期(846608)即停心跳、只发一次 sendMessage 通知，
-      // 避免僵尸流循环（30s 一直给已作废的流发心跳）
+      // 启动心跳：每 30 秒推送一次流式进度，防止长任务完全静默
+      // 流有 10 分钟生命周期(846608 过期)：过期后进度流不可再用，心跳自动降级为
+      // sendMessage 低频进度通知（每 DEAD_NOTIFY_EVERY_MS 一次），保证超长任务期间
+      // 用户始终有反馈；最终结果由 deliverFinal 走 sendMessage 送达，不受流限制
       var heartbeatTimer = null;
       var hbAnnounced = false;
       var hbTarget = notifyId || key;   // SDK sendMessage 需要真实 chatid（单聊=userid，群聊=群 ID）
+      var DEAD_NOTIFY_EVERY_MS = 3 * 60 * 1000;
+      var lastDeadNotify = 0;
       if (ws && fr && streamId) {
         heartbeatTimer = setInterval(function() {
           var entry = this.sessions.get(key);
@@ -226,10 +229,15 @@ class PiBridge {
           var steps = entry.stepCount || 0;
           var tool = entry.currentTool ? " (" + entry.currentTool + ")" : "";
           if (streamState && streamState.dead) {
-            clearInterval(heartbeatTimer);
+            // 流已过期：降级为 sendMessage 低频进度汇报（不推已作废的流）
+            var now = Date.now();
             if (!hbAnnounced) {
               hbAnnounced = true;
-              ws.sendMessage(hbTarget, { msgtype: "text", text: { content: "⏳ 仍在处理（已执行 " + steps + " 步" + tool + "），之前的流已过期，完成后会自动通知你" } }).catch(function() {});
+              lastDeadNotify = now;
+              ws.sendMessage(hbTarget, { msgtype: "text", text: { content: "⏳ 仍在处理（已执行 " + steps + " 步" + tool + "），进度流已达 10 分钟上限，任务转入后台执行，每 3 分钟汇报一次进度，完成后自动通知你" } }).catch(function() {});
+            } else if (now - lastDeadNotify >= DEAD_NOTIFY_EVERY_MS) {
+              lastDeadNotify = now;
+              ws.sendMessage(hbTarget, { msgtype: "text", text: { content: "⏳ 仍在处理…（已执行 " + steps + " 步" + tool + "）" } }).catch(function() {});
             }
             return;
           }
@@ -375,8 +383,8 @@ function connectWS() {
       if (hardTimer) clearTimeout(hardTimer);
       deliverFinal(text, fin).catch(function(e) { console.error("[Bridge] deliverFinal: " + e.message); });
     }
-    // 任务级硬超时：prompt() 挂死时兜底收尾，防僵尸流循环
-    var HARD_TIMEOUT_MS = 25 * 60 * 1000;
+    // 任务级硬超时：prompt() 挂死时兜底收尾，防僵尸流循环（可用 HARD_TIMEOUT_MIN 配置，默认 25 分钟）
+    var HARD_TIMEOUT_MS = (parseInt(process.env.HARD_TIMEOUT_MIN, 10) || 25) * 60 * 1000;
     hardTimer = setTimeout(function() {
       if (replySent) return;
       console.log("[Bridge] hard timeout (25min) hit, force-delivering partial result");
